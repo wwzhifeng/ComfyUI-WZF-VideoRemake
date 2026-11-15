@@ -1,0 +1,22 @@
+[project]
+name = "wzf-videoremake"
+version = "0.1.0"
+description = "One-click video remake for ComfyUI on Viggle Remake (MiniMax H3): auto shot detection, keyframe painting, prompt writing and VRAM tiers"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE.txt" }
+dependencies = []
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Repository = "https://github.com/wwzhifeng/ComfyUI-WZF-VideoRemake"
+Issues = "https://github.com/wwzhifeng/ComfyUI-WZF-VideoRemake/issues"
+
+[tool.comfy]
+PublisherId = "wwzhifeng"
+DisplayName = "WZF VideoRemake"
