@@ -46,7 +46,6 @@ MODE_KEY = {"换整个人": "whole", "只换头": "head", "改物/改场景": "e
 TIERS = ["16G 本地（int8）", "12G 本地（Q8_0，需12G补充包）", "云端 80G+（bf16 + LoRA）"]
 AUTO = "自动（按显卡显存选）"
 RESERVE_12G = 8 * 1024 ** 3  # 官方 12G 配方 --reserve-vram 8；运行时改同一个变量，不用单独的启动器
-_DEFAULT_RESERVE = mm.EXTRA_RESERVED_VRAM
 SIGMAS = {"swap": [1.0, 0.990476, 0.965243, 0.923077, 0.8, 0.631579, 0.0],
           "edit": [1.0, 0.983607, 0.96, 0.923077, 0.857143, 0.705882, 0.0]}
 
@@ -663,12 +662,12 @@ class WZFRemakeModel(io.ComfyNode):
                 raise RuntimeError(f"你的显卡约 {total:.0f}GB 显存。请下载「12G 补充包」（viggle_remake_{kind}-Q8_0.gguf）放进 "
                                    "ComfyUI\\models\\diffusion_models\\，或者把①里「每段最多帧数」改成 124（约 5 秒）。")
             log.info(f"[改拍模型] 显卡 {total:.1f}GB，自动选：{tier}")
-        # 预留显存：12G 卡用官方 8GB；大卡跑 736 档 GGUF 时官方用 --reserve-vram 20
+        # 预留显存：12G 卡用官方 8GB；大卡跑 736 档 GGUF 时官方用 --reserve-vram 20。
+        # 这里只记下来，⑤生成时才设、跑完（出错也算）立刻还原，不留给同一个 ComfyUI 里的别的工作流（如 H3 生视频）
+        reserve = None
         if tier == TIERS[1]:
             total = mm.get_total_memory(mm.get_torch_device()) / 1024 ** 3
-            mm.EXTRA_RESERVED_VRAM = (20 * 1024 ** 3) if (big and total >= 24) else RESERVE_12G
-        else:
-            mm.EXTRA_RESERVED_VRAM = _DEFAULT_RESERVE
+            reserve = (20 * 1024 ** 3) if (big and total >= 24) else RESERVE_12G
         if tier == TIERS[0]:
             model = nodes.UNETLoader().load_unet(find("diffusion_models", f"viggle_remake_{kind}_pruned_int8_convrot.safetensors", keys=("viggle_remake", kind, "int8")),
                                                  "default")[0]
@@ -681,6 +680,7 @@ class WZFRemakeModel(io.ComfyNode):
             lora = nodes.NODE_CLASS_MAPPINGS["LoraLoaderBypassModelOnly"]()
             fn = getattr(lora, lora.FUNCTION)
             model = fn(model, find("loras", f"viggle_remake_{kind}_comfyui.safetensors", keys=("viggle_remake", kind, "comfyui")), 1.0)[0]
+        model.wzf_reserve_vram = reserve
         return io.NodeOutput(model, torch.FloatTensor(SIGMAS[kind]))
 
 
@@ -728,6 +728,18 @@ class WZFRemakeRender(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, sigmas, clip, vae, audio_vae, source, painted, plan, prompt, seed, audio=None) -> io.NodeOutput:
+        reserve = getattr(model, "wzf_reserve_vram", None)
+        old = mm.EXTRA_RESERVED_VRAM
+        if reserve is not None:
+            mm.EXTRA_RESERVED_VRAM = reserve
+            log.info(f"[生成] 本次多留 {reserve / 1024 ** 3:.0f}GB 显存（官方配方），跑完还原")
+        try:
+            return cls._run(model, sigmas, clip, vae, audio_vae, source, painted, plan, prompt, seed, audio)
+        finally:
+            mm.EXTRA_RESERVED_VRAM = old
+
+    @classmethod
+    def _run(cls, model, sigmas, clip, vae, audio_vae, source, painted, plan, prompt, seed, audio):
         P = json.loads(plan)
         ws, n = P["windows"], P["frames"]
         prompts = split_prompts(prompt)
