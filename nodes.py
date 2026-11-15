@@ -224,7 +224,7 @@ class WZFRemakePlan(io.ComfyNode):
                 io.String.Input("who", default="", display_name="换谁（多人时写清楚）",
                                 tooltip="例：穿灰色外套的女人 / 左边的男人。画面里只有一个人可以不填。改物时不用填。"),
                 io.String.Input("target", multiline=True, default="", display_name="改成什么样",
-                                tooltip="换人：可以补充衣服，如“穿红色西装”；长视频（分几段）建议把衣服写清楚，几张关键帧才穿得一样。"
+                                tooltip="换人：可以写衣服，如“穿红色西装”；不写就自动按原片的衣服画（每张关键帧穿得一样）。"
                                         "改物：写清楚怎么改，如“把红伞换成透明伞”。中文就行。"),
                 io.Float.Input("start_time", default=0.0, min=0.0, max=36000.0, step=0.1, display_name="从第几秒开始"),
                 io.Float.Input("seconds", default=30.0, min=3.8, max=30.0, step=0.1, display_name="处理多长（秒，最长 30）",
@@ -363,12 +363,18 @@ class WZFRemakePaint(io.ComfyNode):
             look = _phrase(_ask(vlm, "Describe the person in this photo in one short English phrase: apparent age and gender, "
                                      "face, hair style and hair colour. No clothes, no background.", [_small(reference)], 80), 30)
             log.info(f"[画关键帧] 参考图里的人：{look}")
+        outfit = target
+        if mode == "whole" and not target:
+            # 用户没写衣服：8B 看第一张关键帧写出原来的衣服，每张关键帧都用这同一句，免得各画各的
+            # （11-15 实测：分开画时有一张把黑衬衫画成米色，一镜到底里衬衫中途变色）
+            outfit = _phrase(_ask(vlm, CLOTHES_ASK.format(who=who or "the main person"), [_small(source[first:first + 1])], 60), 25)
+            log.info(f"[画关键帧] 用户没写衣服，按原片的衣服画：{outfit}")
         if mode == "head":
             prompt, sampler = HEADSWAP, "lcm"
         elif mode == "whole":
             prompt = (f"Replace {who or 'the main person'} in <image1> with the person from <image2>"
                       + (f" ({look})" if look else "") + ": the face, the hair style and the hair colour of <image2>"
-                      + (f"; outfit: {target}" if target else "")
+                      + (f"; outfit: {outfit}" if outfit else "")
                       + ". Keep exactly the same pose, hand positions, head angle, expression, objects, room, lighting, "
                         "camera angle and composition as <image1>. Photorealistic, sharp details.")
             sampler = "euler"
@@ -446,6 +452,8 @@ def _small(img, w=640):
     return resize(img[:1, ..., :3], w, max(32, round(w * img.shape[1] / img.shape[2])))
 
 
+CLOTHES_ASK = ("Describe the clothes of {who} in this video frame in one short English phrase: each garment and its colour, "
+               "for example: grey blazer, black shirt, black trousers. Clothes only, no person, no background.")
 VIS_DESC = {
     "swap": ("Describe {who} in this video frame in one short English phrase: apparent age and gender, hair, clothes. "
              "No background."),
