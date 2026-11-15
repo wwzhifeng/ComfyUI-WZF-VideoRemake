@@ -9,6 +9,10 @@ ComfyUI-WZF-VideoRemake — Copyright (c) 2026 wwzhifeng, MIT License.
   the example prompts and the prompt brief in Viggle Remake's `mcp/` directory, which is licensed under the Apache License 2.0
   (copy in `data/LICENSE-Viggle-Apache-2.0.txt`). Changes: rewritten as fixed templates filled by a local vision-language model;
   added head-only and edit variants.
+  The long-video segmentation in `remake_core.py` (`windows`, `deflash`, `LENS`, `P`) is ported from Viggle Remake's
+  `mcp/viggle_remake_mcp/kit.py`, and the relay prefix in `nodes.py` (`prefix_latent`) follows `RemakePrefix` in
+  Viggle Remake's ComfyUI nodes (both Apache License 2.0). Changes: per-window keyframe choice without a planning agent
+  (`window_keyframes`), frames held in memory instead of files.
 - The head-swap instruction text used for Qwen-Image 2.1 follows the prompt published with the BFS head-swap LoRA
   (Alissonerdx/BFS-Best-Face-Swap).
 

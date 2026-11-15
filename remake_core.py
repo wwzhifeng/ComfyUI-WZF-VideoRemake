@@ -4,6 +4,8 @@
 - 切镜：缩到 64x36 后看相邻帧的像素差 + 颜色直方图差，取局部最大且明显高于周围的点。
 - 关键帧：每个镜头一张，取镜头中间；镜头超过 4 个时取最长的 4 个（官方智能体规则：先保证镜头最长的几个）。
 - 时间戳：MM:SS.mmm（官方六段式提示词的写法）。
+- 长视频：照 Viggle 官方的分段办法切成几段，段尽量断在切镜处；一个镜头比一段还长时，下一段接着上一段成片的最后
+  17 帧继续（接力）；最后把每段自己负责的帧拼起来，切镜接缝处修 1～2 帧闪帧。
 """
 import math
 
@@ -103,3 +105,87 @@ def pick_keyframes(shots, max_refs=4):
 def mmss(frame):
     t = frame / FPS
     return f"{int(t // 60):02d}:{t % 60:06.3f}"
+
+
+# ---------------- 长视频分段（移植自 Viggle Remake mcp/viggle_remake_mcp/kit.py，Apache-2.0，见 NOTICE.md） ----------------
+LENS = [17 * k + 5 for k in range(5, 21)]  # 90..345
+P = 17  # 接力段的前缀：上一段成片的最后 17 帧（VAE 的一个片段）
+
+
+def windows(cuts, n, maxlen, maxcuts=3):
+    """切窗口：尽量在切镜点结束，每段 17k+5 帧、不超过 maxlen，一段里最多 maxcuts 个切镜（切镜太多模型会丢镜头、乱序）。
+    一个镜头比一段还长时不硬切（接缝处脸会跳），下一段做"接力"：开头 P 帧是上一段成片的帧（prefix_of/prefix_at）。
+    最后一段对齐到片尾。render = 这段实际渲染的帧范围，own = 这段负责输出的帧范围。"""
+    ls = [x for x in LENS if x <= maxlen]
+    rnd = lambda m: min(x for x in ls if x >= m)  # noqa: E731
+    out, s, p = [], 0, 0
+    while True:
+        r = s - p
+        cand = [e for e in cuts if r + ls[0] <= e <= r + ls[-1] and s < e < n and r + rnd(e - r) <= n]
+        if n - r <= ls[-1] and (not cand or sum(s < c < n for c in cuts) <= maxcuts):
+            break
+        ok = [e for e in cand if sum(r < c < r + rnd(e - r) for c in cuts) <= maxcuts]
+        e = max(ok) if ok else min(cand) if cand else r + ls[-1]
+        out.append({"render": [r, r + rnd(e - r)], "own": [s, e],
+                    **({"prefix_of": len(out) - 1, "prefix_at": r - out[-1]["render"][0]} if p else {})})
+        s, p = e, 0 if e in cuts else P
+    ln = rnd(max(n - s + p, ls[0]))
+    if p:
+        s = out[-1]["own"][1] = n - ln + P
+        out.append({"render": [n - ln, n], "own": [s, n], "prefix_of": len(out) - 1, "prefix_at": n - ln - out[-1]["render"][0]})
+    else:
+        out.append({"render": [n - ln, n], "own": [s, n]})
+    return out
+
+
+def window_keyframes(ws, shots, max_refs=4):
+    """每段给它负责的每个镜头选一帧关键帧（镜头中间，离边缘至少 6 帧），最多 max_refs 个（取段内最长的）。
+    接力段开头那个延续上一段的镜头：官方默认不给关键帧（上一段的结尾已经定了长相），但脸在接力之后才转过来
+    （背影 / 侧脸 → 正脸）时会变回原来的人（11-15 实测：30 秒一镜到底第 3 段从背影接力，转正脸后成了原演员；
+    官方指南也写了这种情况要补一帧）。所以给它列 3 个候选帧，由②让 8B 挑一帧看得见脸的来画，都看不见就不画。
+    返回每段 [(帧号, 候选帧列表或 None), ...]（全片帧号，按帧号排）。"""
+    res = []
+    for w in ws:
+        a0, z0 = w["own"]
+        r0, r1 = w["render"]
+        cand = []
+        for s, e in shots:
+            lo, hi = max(s, a0, r0), min(e, z0, r1)
+            if hi - lo < 1:
+                continue
+            m = min(6, (hi - lo) // 2)
+            mid = min(max((lo + hi) // 2, lo + m), hi - 1 - m)
+            relay = "prefix_of" in w and s < a0
+            q = (hi - lo) // 4
+            cand.append((hi - lo, mid, sorted({lo + q, mid, hi - 1 - q}) if relay else None))
+        keep = sorted(cand, key=lambda t: -t[0])[:max_refs]
+        res.append(sorted(((f, c) for _, f, c in keep), key=lambda t: t[0]))
+    return res
+
+
+def deflash(v, src, ws, cuts):
+    """段从切镜点开始时，模型可能把切镜放偏 1~2 帧，成片在接缝处闪一下上个镜头。切镜点前后 2 帧里，
+    哪一帧站错了边就用相邻帧覆盖。v、src: [N,H,W,C]，原地修改，返回改过的帧号。"""
+    cuts = set(cuts)
+
+    def sides(x):
+        x = x[:, ::4, ::4, :3].float()
+        return [bool((x[k] - x[0]).abs().mean() < (x[k] - x[7]).abs().mean()) for k in range(2, 6)]
+
+    todo = []
+    for w in ws[1:]:
+        b = w["own"][0]
+        if b not in cuts or b < 4 or b + 4 > v.shape[0] or any(0 < abs(b - c) < 8 for c in cuts):
+            continue
+        want, got = sides(src[b - 4:b + 4]), sides(v[b - 4:b + 4])
+        fix = {}
+        for k in range(4):
+            if want[k] and not got[k]:
+                fix[b - 2 + k] = -1
+        for k in range(3, -1, -1):
+            if not want[k] and got[k]:
+                fix[b - 2 + k] = 1
+        todo += sorted(fix.items(), key=lambda t: -t[0] * t[1])
+    for f, s in todo:
+        v[f] = v[f + s]
+    return [f for f, _ in todo]
