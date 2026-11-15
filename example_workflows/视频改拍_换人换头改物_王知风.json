@@ -1,7 +1,7 @@
 {
  "id": "fd784ff5-827e-4fe0-a76a-45f8220ba904",
  "revision": 0,
- "last_node_id": 26,
+ "last_node_id": 27,
  "last_link_id": 29,
  "nodes": [
   {
@@ -1263,6 +1263,36 @@
     0,
     "randomize"
    ]
+  },
+  {
+   "id": 27,
+   "type": "WZFBigLink",
+   "pos": [
+    -30,
+    -430
+   ],
+   "size": [
+    1700,
+    330
+   ],
+   "flags": {},
+   "order": 18,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [],
+   "title": "☁️ 跑不动？上云端（点击打开）",
+   "color": "#7a5a00",
+   "bgcolor": "#3a2600",
+   "properties": {
+    "text": "跑不动？上云端",
+    "sub": "满血全精度　注册送 1000 积分 ›",
+    "url": "https://www.runninghub.cn?inviteCode=g8isca0y",
+    "fontSize": 130,
+    "subSize": 60,
+    "textColor": "#ffd166",
+    "subColor": "#ffffff",
+    "panelColor": "#3a2600"
+   }
   }
  ],
  "links": [
@@ -1528,10 +1558,10 @@
  "config": {},
  "extra": {
   "ds": {
-   "scale": 0.6,
+   "scale": 0.5,
    "offset": [
-    60,
-    120
+    210,
+    660
    ]
   }
  },
