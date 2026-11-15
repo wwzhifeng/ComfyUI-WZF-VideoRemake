@@ -55,11 +55,36 @@ HEADSWAP = ("head_swap: start with <image1> as the base image, keeping its light
             "expressions from <image1>, high quality, sharp details, 4k")
 
 
-def find(folder, name):
-    for n in folder_paths.get_filename_list(folder):
-        if n.replace("\\", "/").split("/")[-1] == name:
-            return n
+def _base(n):
+    return n.replace("\\", "/").split("/")[-1]
+
+
+def find(folder, name, *alts, keys=None, optional=False):
+    """先按准确文件名找（name，再依次 alts），找不到再按关键词找（文件名同时包含 keys 里每个词，不分大小写）。
+    云平台（如 RunningHub）的模型库是用户上传的，文件名常被改，例如 Viggle_Remake_swap_pruned_int8_convrot_1108_S。"""
+    try:
+        names = folder_paths.get_filename_list(folder)
+    except Exception:  # noqa: BLE001  文件夹类型没登记（如没装 ComfyUI-GGUF 时的 unet_gguf）
+        names = []
+    for want in (name,) + alts:
+        for n in names:
+            if _base(n) == want:
+                return n
+    if keys:
+        hits = sorted(n for n in names if all(k.lower() in _base(n).lower() for k in keys))
+        if hits:
+            log.info(f"[找模型] 没有 {name}，按关键词 {list(keys)} 用 {hits[0]}")
+            return hits[0]
+    if optional:
+        return None
     raise RuntimeError(f"缺少模型：ComfyUI/models/{folder}/{name}\n请按使用说明下载后放进对应文件夹。")
+
+
+TE_ALTS = ("qwen3vl_8b_bf16.safetensors", "qwen3vl_8b_int8_convrot.safetensors", "qwen3vl_8b_fp8_scaled.safetensors")
+
+
+def qwen_te():
+    return find("text_encoders", QWEN["te"], *TE_ALTS)
 
 
 def free():
@@ -199,7 +224,7 @@ class WZFRemakePaint(io.ComfyNode):
             raise RuntimeError("「改物/改场景」要在①里写清楚「改成什么样」，例如：把红伞换成透明伞。")
         swap = mode in ("whole", "head")
         # 8B 先看参考图写一句长相，写进画图提示词（11-14 实测：不写具体长相时，特写镜头里 Qwen 只换了衣服、脸没换）
-        vlm = nodes.CLIPLoader().load_clip(find("text_encoders", QWEN["te"]), VLM_TYPE, "default")[0] if swap else None
+        vlm = nodes.CLIPLoader().load_clip(qwen_te(), VLM_TYPE, "default")[0] if swap else None
         look = ""
         if swap:
             look = _phrase(_ask(vlm, "Describe the person in this photo in one short English phrase: apparent age and gender, "
@@ -219,11 +244,16 @@ class WZFRemakePaint(io.ComfyNode):
                       + ". Keep everything else exactly the same: the people, their faces, hair, clothes and poses, the "
                         "background, lighting, camera angle, framing and composition. Photorealistic, sharp details.")
             sampler = "euler"
-        model = nodes.UNETLoader().load_unet(find("diffusion_models", QWEN["unet"]), "default")[0]
-        for k in ("detail", "turbo") + (("bfs",) if mode == "head" else ()):
-            model = nodes.LoraLoaderModelOnly().load_lora_model_only(model, find("loras", QWEN[k]), 1.0)[0]
+        model = nodes.UNETLoader().load_unet(find("diffusion_models", QWEN["unet"], "qwen_image_2.1_bf16.safetensors"), "default")[0]
+        loras = [find("loras", QWEN["detail"], optional=True),  # 细节 LoRA 可选：云平台没有就跳过
+                 find("loras", QWEN["turbo"], keys=("viggle-turbo", "6step"))]
+        if mode == "head":
+            loras.append(find("loras", QWEN["bfs"], keys=("bfs_head_v1.1", "qwen")))
+        for name in loras:
+            if name:
+                model = nodes.LoraLoaderModelOnly().load_lora_model_only(model, name, 1.0)[0]
         model = QwenImage21Cache.execute(model, "auto", "default")[0]
-        clip = nodes.CLIPLoader().load_clip(find("text_encoders", QWEN["te"]), "qwen_image", "default")[0]
+        clip = nodes.CLIPLoader().load_clip(qwen_te(), "qwen_image", "default")[0]
         vae = nodes.VAELoader().load_vae(find("vae", QWEN["vae"]))[0]
         H, W = keyframes.shape[1], keyframes.shape[2]
 
@@ -375,7 +405,7 @@ class WZFRemakePrompt(io.ComfyNode):
             return io.NodeOutput(manual.strip())
         P = json.loads(plan)
         swap = P["mode"] != "edit"
-        vlm = nodes.CLIPLoader().load_clip(find("text_encoders", QWEN["te"]), VLM_TYPE, "default")[0]
+        vlm = nodes.CLIPLoader().load_clip(qwen_te(), VLM_TYPE, "default")[0]
         try:
             ask = PAIR_ASK["swap" if swap else "edit"].format(
                 who=f" ({P['who']})" if P["who"] else "", target=P["target"])
@@ -424,14 +454,21 @@ class WZFRemakeModel(io.ComfyNode):
     def execute(cls, plan, tier) -> io.NodeOutput:
         P = json.loads(plan)
         kind = "edit" if P["mode"] == "edit" else "swap"
-        have = lambda n: any(x.replace("\\", "/").split("/")[-1] == n for x in folder_paths.get_filename_list("diffusion_models"))  # noqa: E731
+        # .gguf 不在 diffusion_models 列表里（要查 ComfyUI-GGUF 登记的 unet_gguf），以前这里永远找不到 Q8_0
+        has_bf16 = (find("diffusion_models", "minimax_h3_fl2va_bf16.safetensors", optional=True)
+                    and find("loras", f"viggle_remake_{kind}_comfyui.safetensors", keys=("viggle_remake", kind, "comfyui"),
+                             optional=True))
+        has_q8 = find("unet_gguf", f"viggle_remake_{kind}-Q8_0.gguf", keys=("viggle_remake", kind, "q8_0"), optional=True)
+        big = min(P["width"], P["height"]) >= 736 and P["frames"] > 124  # 官方：736 档 int8 跑 226 帧在 48G、80G 上都会爆显存
         if tier == AUTO:
             total = mm.get_total_memory(mm.get_torch_device()) / 1024 ** 3
-            if total >= 70 and have("minimax_h3_fl2va_bf16.safetensors"):
+            if total >= 70 and has_bf16:
                 tier = TIERS[2]
+            elif big and has_q8:
+                tier = TIERS[1]
             elif total >= 15:
                 tier = TIERS[0]
-            elif have(f"viggle_remake_{kind}-Q8_0.gguf"):
+            elif has_q8:
                 tier = TIERS[1]
             elif P["frames"] <= 124:
                 tier = TIERS[0]  # 官方：12G 用 int8 只能跑 124 帧
@@ -439,19 +476,24 @@ class WZFRemakeModel(io.ComfyNode):
                 raise RuntimeError(f"你的显卡约 {total:.0f}GB 显存。请下载「12G 补充包」（viggle_remake_{kind}-Q8_0.gguf）放进 "
                                    "ComfyUI\\models\\diffusion_models\\，或者把①里「最多帧数」改成 124（约 5 秒）。")
             log.info(f"[改拍模型] 显卡 {total:.1f}GB，自动选：{tier}")
-        mm.EXTRA_RESERVED_VRAM = RESERVE_12G if tier == TIERS[1] else _DEFAULT_RESERVE
+        # 预留显存：12G 卡用官方 8GB；大卡跑 736 档 GGUF 时官方用 --reserve-vram 20
+        if tier == TIERS[1]:
+            total = mm.get_total_memory(mm.get_torch_device()) / 1024 ** 3
+            mm.EXTRA_RESERVED_VRAM = (20 * 1024 ** 3) if (big and total >= 24) else RESERVE_12G
+        else:
+            mm.EXTRA_RESERVED_VRAM = _DEFAULT_RESERVE
         if tier == TIERS[0]:
-            model = nodes.UNETLoader().load_unet(find("diffusion_models", f"viggle_remake_{kind}_pruned_int8_convrot.safetensors"),
+            model = nodes.UNETLoader().load_unet(find("diffusion_models", f"viggle_remake_{kind}_pruned_int8_convrot.safetensors", keys=("viggle_remake", kind, "int8")),
                                                  "default")[0]
         elif tier == TIERS[1]:
             if "UnetLoaderGGUF" not in nodes.NODE_CLASS_MAPPINGS:
                 raise RuntimeError("12G 档要 ComfyUI-GGUF 节点（基础包自带），当前没加载。")
-            model = nodes.NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]().load_unet(find("diffusion_models", f"viggle_remake_{kind}-Q8_0.gguf"))[0]
+            model = nodes.NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]().load_unet(find("unet_gguf", f"viggle_remake_{kind}-Q8_0.gguf", keys=("viggle_remake", kind, "q8_0")))[0]
         else:
             model = nodes.UNETLoader().load_unet(find("diffusion_models", "minimax_h3_fl2va_bf16.safetensors"), "default")[0]
             lora = nodes.NODE_CLASS_MAPPINGS["LoraLoaderBypassModelOnly"]()
             fn = getattr(lora, lora.FUNCTION)
-            model = fn(model, find("loras", f"viggle_remake_{kind}_comfyui.safetensors"), 1.0)[0]
+            model = fn(model, find("loras", f"viggle_remake_{kind}_comfyui.safetensors", keys=("viggle_remake", kind, "comfyui")), 1.0)[0]
         return io.NodeOutput(model, torch.FloatTensor(SIGMAS[kind]))
 
 

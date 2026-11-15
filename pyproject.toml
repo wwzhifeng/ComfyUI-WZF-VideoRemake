@@ -1,6 +1,6 @@
 [project]
 name = "wzf-videoremake"
-version = "0.1.0"
+version = "0.1.1"
 description = "One-click video remake for ComfyUI on Viggle Remake (MiniMax H3): auto shot detection, keyframe painting, prompt writing and VRAM tiers"
 readme = "README.md"
 requires-python = ">=3.10"
