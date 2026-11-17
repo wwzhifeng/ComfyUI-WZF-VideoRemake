@@ -382,14 +382,31 @@ class WZFRemakePaint(io.ComfyNode):
         if swap:
             look = _phrase(_ask(vlm, PERSON_ASK, [_small(reference)], 80), 30)
             log.info(f"[画关键帧] 参考图里的人：{look}")
+        bfs = find("loras", QWEN["bfs"], keys=("bfs_head_v1.1", "qwen"), optional=mode == "whole") if swap else None
+        # 换整个人（有 BFS 换头 LoRA 时）分三步，每步只干一件事，参考照片只在画面和它不像的时候给：
+        # ① 在原帧上用 BFS 照参考照片换头；② 脸小就单独放大修脸；③ 只给文字改身形、衣服和残留的头发，脸不动。
+        # 11-17 实测：先改衣服再换头时，画面里的人已经和参考照片很像（同一件毛衣），模型直接把整张参考照片原样输出（连他房间一起）；
+        # 只画一遍时脸型沿用原帧（女换男成了"瘦脸版的他"）；保留原片衣服时成了男人头配抹胸。
+        # 没有 BFS 时退回旧画法（一遍、带参考照片、穿原片衣服）
+        staged = mode == "whole" and bool(bfs) and bool(look)
         outfit = target
         if mode == "whole" and not target:
-            # 用户没写衣服：8B 看第一张关键帧写出原来的衣服，每张关键帧都用这同一句，免得各画各的
-            # （11-15 实测：分开画时有一张把黑衬衫画成米色，一镜到底里衬衫中途变色）
-            outfit = _phrase(_ask(vlm, CLOTHES_ASK.format(who=who or "the main person"), [_small(source[first:first + 1])], 60), 25)
-            log.info(f"[画关键帧] 用户没写衣服，按原片的衣服画：{outfit}")
-        if mode == "head":
+            # 用户没写衣服：换整个人 = 衣服也换成参考照片里的。8B 写一句，每张关键帧都用这同一句，免得各画各的
+            # （11-15 实测：分开画时一张黑衬衫画成米色）。参考照片看不到衣服（只有头）或退回旧画法时，用原片的衣服
+            outfit = _phrase(_ask(vlm, REF_CLOTHES_ASK, [_small(reference)], 60), 25) if staged else ""
+            if outfit and "NONE" not in outfit.upper():
+                log.info(f"[画关键帧] 用户没写衣服，按参考照片的衣服画：{outfit}")
+            else:
+                outfit = _phrase(_ask(vlm, CLOTHES_ASK.format(who=who or "the main person"), [_small(source[first:first + 1])], 60), 25)
+                log.info(f"[画关键帧] 按原片的衣服画：{outfit}")
+        body = ""
+        if mode == "head" or staged:
             prompt, sampler = HEADSWAP, "lcm"
+            if staged:
+                body = (f"In <image1>, keep the face and the head of the person exactly the same. Make the rest of the person "
+                        f"match {look}" + (f", wearing {outfit}" if outfit else "") + ": body shape and clothes; remove any "
+                        "hair that does not belong to this hair style. Keep exactly the same pose, hand positions, expression, "
+                        "objects, room, lighting, camera angle and composition. Photorealistic, sharp details.")
         elif mode == "whole":
             prompt = (f"Replace {who or 'the main person'} in <image1> with the person from <image2>"
                       + (f" ({look})" if look else "") + ": the face, the hair style and the hair colour of <image2>"
@@ -408,41 +425,45 @@ class WZFRemakePaint(io.ComfyNode):
         for name in loras:
             if name:
                 model = nodes.LoraLoaderModelOnly().load_lora_model_only(model, name, 1.0)[0]
-        # 换头模型 = 同一个底模 + BFS 换头 LoRA。「只换头」直接用它画；「换整个人」先整个人换掉（衣服、身形、发型），
-        # 再用它把头照参考图重画一遍（11-17 实测：只画一遍时脸型沿用原帧那个人，女换男成了"瘦脸版的他"，不够像）
-        bfs = find("loras", QWEN["bfs"], keys=("bfs_head_v1.1", "qwen"), optional=mode == "whole") if swap else None
+        # 换头模型 = 同一个底模 + BFS 换头 LoRA（只换头、换整个人第①②步、修脸都用它）
         head = nodes.LoraLoaderModelOnly().load_lora_model_only(model, bfs, 1.0)[0] if bfs else None
-        if mode == "head":
-            model = head
+        head = QwenImage21Cache.execute(head, "auto", "default")[0] if head is not None else None
         model = QwenImage21Cache.execute(model, "auto", "default")[0]
-        if mode == "whole" and head is not None:
-            head = QwenImage21Cache.execute(head, "auto", "default")[0]
-        else:
-            head = None
         clip = nodes.CLIPLoader().load_clip(qwen_te(), "qwen_image", "default")[0]
         vae = nodes.VAELoader().load_vae(find("vae", QWEN["vae"]))[0]
         H, W = keyframes.shape[1], keyframes.shape[2]
 
-        def draw(base, m, p, smp, s):
+        def draw(base, m, p, smp, s, ref=True):
             imgs = {"image_1": base}
-            if reference is not None:
+            if reference is not None and ref:
                 imgs["image_2"] = reference[:1, ..., :3]
             enc = TextEncodeQwenImage21.execute(clip, p, "", vae, 1024, images=imgs)
             samples = nodes.common_ksampler(m, s, steps, 1.0, smp, "simple", enc[0], enc[1], enc[2])[0]
             return nodes.VAEDecode().decode(vae, samples)[0][:1, ..., :3]
 
-        hm = head if head is not None else (model if mode == "head" else None)  # 修脸用的换头模型
-
         def paint(i, s):
-            img = draw(keyframes[i:i + 1], model, prompt, sampler, s)
-            if head is not None:  # 第二遍：只重画头（接第一遍的原尺寸结果，不先缩小）
-                img = draw(img, head, HEADSWAP, "lcm", s)
-            b = box(todo[i]) if hm is not None else None
+            base = keyframes[i:i + 1]
+            b = box(todo[i]) if head is not None else None
+            if mode == "head" or staged:
+                # ① 原帧上换头。保险：头以外的背景整个变了 = 把参考照片照搬了，换种子再来；两次都这样就退回原帧（自检会判没换、重画）
+                img = base
+                for k in range(2):
+                    out = draw(base, head, HEADSWAP, "lcm", s + 13 * k)
+                    d = _bg_diff(base, out, b)
+                    log.info(f"[画关键帧] 第 {i + 1} 张换头：背景变化 {d:.3f}{'，照搬了参考照片，丢掉' if d > COPY_DIFF else ''}")
+                    if d <= COPY_DIFF:
+                        img = out
+                        break
+            else:
+                img = draw(base, model, prompt, sampler, s)
             if b and max((b[2] - b[0]) * img.shape[2], (b[3] - b[1]) * img.shape[1]) < FIX_FACE_PX:
-                # 修脸：脸小（远景 / 中景）时把头部裁出来，放大到约 100 万像素用换头模型照参考图再画一遍，羽化贴回。
+                # ② 修脸：脸小（远景 / 中景）时把头部裁出来，放大到约 100 万像素用换头模型照参考图再画一遍，羽化贴回。
                 # 画关键帧时整张图只有约 100 万像素，远景里脸才一两百像素，五官画不出参考图的样子
-                img = _paste_face(img, b, lambda crop: draw(crop, hm, HEADSWAP, "lcm", s + 7))
-                log.info(f"[画关键帧] 第 {i + 1} 张脸小，单独放大修了一遍脸")
+                fixed = _paste_face(img, b, lambda crop: draw(crop, head, HEADSWAP, "lcm", s + 7))
+                log.info(f"[画关键帧] 第 {i + 1} 张脸小，单独放大修脸：{'修好了' if fixed is not None else '照搬了参考照片，不修'}")
+                img = img if fixed is None else fixed
+            if staged:  # ③ 只给文字改身形、衣服、残留头发（不给参考照片）
+                img = draw(img, model, body, "euler", s, ref=False)
             return resize(img, W, H)
 
         outs = []
@@ -497,7 +518,7 @@ def _small(img, w=640):
 
 
 PERSON_ASK = ("Describe the person in this photo in one short English phrase: apparent age and gender, face, hair style and "
-              "hair colour. No clothes, no background.")
+              "hair colour. No clothes, no background, no facial expression.")
 PICK_ASK = "Which description fits the person in this photo better? A: {a}. B: {b}. Answer A or B."
 FACE_BOX = ("Find the face of {who} in this image. Reply only with its bounding box as [x1, y1, x2, y2] in 0-1000 "
             "coordinates. If no face is visible (for example the person is seen from behind), reply NONE.")
@@ -518,6 +539,22 @@ def _area(b):
 
 
 FIX_FACE_PX = 320  # 画好的关键帧里脸（框的长边）小于这么多像素就单独修脸
+COPY_DIFF = 0.15  # 换头前后头以外的背景平均差超过它 = 模型把参考照片照搬了（11-17 实测照搬时 0.37）
+
+
+def _bg_diff(a, c, b):
+    """a、c 同尺寸 [1,H,W,3]：头以外区域（脸框左右各放一个脸宽、往下放两个脸高，带上脖子肩膀）的平均差。没有框就比整张。"""
+    H, W = a.shape[1], a.shape[2]
+    if c.shape != a.shape:
+        c = resize(c, W, H)
+    keep = torch.ones(H, W, dtype=torch.bool)
+    if b:
+        x1, y1, x2, y2 = b
+        w, h = x2 - x1, y2 - y1
+        keep[max(0, int((y1 - h) * H)):min(H, int((y2 + 2 * h) * H)), max(0, int((x1 - w) * W)):min(W, int((x2 + w) * W))] = False
+    if int(keep.sum()) < 100:
+        keep[:] = True
+    return float((a[0] - c[0].to(a)).abs().mean(-1)[keep].mean())
 
 
 def _paste_face(img, b, redraw):
@@ -532,6 +569,8 @@ def _paste_face(img, b, redraw):
     new = resize(redraw(crop), side, side).to(crop)
     t = torch.linspace(-1, 1, side, device=crop.device)
     d = torch.maximum(t.view(-1, 1).abs(), t.view(1, -1).abs())
+    if float((crop - new).abs().mean(-1)[0][d > 0.7].mean()) > COPY_DIFF:  # 外圈（头以外）整个变了 = 照搬了参考照片
+        return None
     m = ((1 - d) / 0.3).clamp(0, 1)[None, ..., None]  # 中间全用新画的，外圈 15% 渐变回原图
     out = img.clone()
     out[:, Y1:Y1 + side, X1:X1 + side] = crop * (1 - m) + new * m
@@ -550,6 +589,9 @@ def _crop(img, b, pad=0.4):
 
 CLOTHES_ASK = ("Describe the clothes of {who} in this video frame in one short English phrase: each garment and its colour, "
                "for example: grey blazer, black shirt, black trousers. Clothes only, no person, no background.")
+REF_CLOTHES_ASK = ("Describe the clothes of the person in this photo in one short English phrase: each garment and its colour, "
+                   "for example: grey blazer, black shirt, black trousers. Clothes only, no person, no background. "
+                   "If no clothes are visible, reply NONE.")
 VIS_DESC = {
     "swap": ("Describe {who} in this video frame in one short English phrase: apparent age and gender, hair, clothes. "
              "No background."),
