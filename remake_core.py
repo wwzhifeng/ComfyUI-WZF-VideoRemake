@@ -143,7 +143,8 @@ def window_keyframes(ws, shots, max_refs=4):
     接力段开头那个延续上一段的镜头：官方默认不给关键帧（上一段的结尾已经定了长相），但脸在接力之后才转过来
     （背影 / 侧脸 → 正脸）时会变回原来的人（11-15 实测：30 秒一镜到底第 3 段从背影接力，转正脸后成了原演员；
     官方指南也写了这种情况要补一帧）。所以给它列 3 个候选帧，由②让 8B 挑一帧看得见脸的来画，都看不见就不画。
-    返回每段 [(帧号, 候选帧列表或 None), ...]（全片帧号，按帧号排）。"""
+    返回每段 [(帧号, 候选帧列表或 None, (lo, hi)), ...]（全片帧号，按帧号排）。(lo, hi) 是这个关键帧可以挑的范围
+    （镜头在这段里的部分，去掉两头各 6 帧）：换人时②在这个范围里挑人脸最大的一帧（官方指南：选人最大、最清楚的帧）。"""
     res = []
     for w in ws:
         a0, z0 = w["own"]
@@ -157,9 +158,9 @@ def window_keyframes(ws, shots, max_refs=4):
             mid = min(max((lo + hi) // 2, lo + m), hi - 1 - m)
             relay = "prefix_of" in w and s < a0
             q = (hi - lo) // 4
-            cand.append((hi - lo, mid, sorted({lo + q, mid, hi - 1 - q}) if relay else None))
+            cand.append((hi - lo, mid, sorted({lo + q, mid, hi - 1 - q}) if relay else None, (lo + m, hi - m)))
         keep = sorted(cand, key=lambda t: -t[0])[:max_refs]
-        res.append(sorted(((f, c) for _, f, c in keep), key=lambda t: t[0]))
+        res.append(sorted(((f, c, r) for _, f, c, r in keep), key=lambda t: t[0]))
     return res
 
 

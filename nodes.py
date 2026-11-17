@@ -263,9 +263,9 @@ class WZFRemakePlan(io.ComfyNode):
             r0, r1 = w["render"]
             segs = [(max(s, r0), min(e, r1)) for s, e in shots if s < r1 and e > r0]
             w = {**w, "kf": [], "shots": [{"start": s - r0, "end": e - r0} for s, e in segs]}
-            for f, cands in fs:
+            for f, cands, rng in fs:
                 w["kf"].append(len(kfs))
-                kfs.append({"frame": f, **({"cands": cands} if cands else {})})
+                kfs.append({"frame": f, "range": list(rng), **({"cands": cands} if cands else {})})
             win.append(w)
         plan = {"mode": MODE_KEY[mode], "mode_cn": mode, "who": who.strip(), "target": target.strip(),
                 "frames": n, "max_window": max(w["render"][1] - w["render"][0] for w in ws),
@@ -306,7 +306,7 @@ class WZFRemakePaint(io.ComfyNode):
         return io.Schema(
             node_id="WZFRemakePaint", display_name="② 画关键帧（Qwen 改图）", category="王知风/视频改拍",
             description="把每个镜头选出的那一帧改成目标样子。成片里的人长什么样，完全由这几张图决定。"
-                        "接力段先让 8B 从 3 个候选帧里挑一帧看得见脸的来画，都看不见就不画。",
+                        "换人 / 换头时，8B 在每个镜头里挑人脸最大的一帧来画（接力段都看不见脸就不画）。",
             inputs=[
                 io.Image.Input("source"),
                 io.String.Input("plan", force_input=True),
@@ -337,15 +337,35 @@ class WZFRemakePaint(io.ComfyNode):
         # 先看第一张关键帧写一句英文描述，再对每个候选帧单独问"有没有它"（11-15 实测：两张图对比着问"是不是同一个人"，
         # 8B 全答 NO；单张图按描述问，9 个候选帧全对）
         first = next(k["frame"] for k in kfs if "cands" not in k)
-        q, frames = None, []
+        q, frames, boxes = None, [], {}
+
+        def box(f):  # 8B 框出要换的人的脸（全片帧号 → 相对坐标框或 None），同一帧只问一次
+            if f not in boxes:
+                boxes[f] = _face_box(vlm, source[f:f + 1], who)
+            return boxes[f]
+
         for k in kfs:
+            if swap:
+                # 换人：在这个关键帧能挑的范围里均匀看 8 帧，选要换的人脸最大的一帧（官方指南：选人最大、最清楚的帧）。
+                # 11-17 实测：一个连续推拉镜头取中间帧落在远景、脸很小，开头结尾的特写没有新脸可参照，成片特写里还是原来的人。
+                # 接力段也这样挑；范围里都看不见脸（背影）就不画
+                lo, hi = k.get("range", [k["frame"], k["frame"] + 1])
+                hi = max(hi, lo + 1)
+                pool = {k["frame"], *(k.get("cands") or []), *(lo + (hi - 1 - lo) * j // 7 for j in range(8))}
+                pool = sorted(f for f in pool if 0 <= f < source.shape[0])
+                best = max(pool, key=lambda f: (_area(box(f)), -abs(f - k["frame"])))
+                pick = best if _area(box(best)) > 0 else (None if "cands" in k else k["frame"])
+                log.info(f"[画关键帧] 挑脸最大的一帧：第 {pick} 帧（原定第 {k['frame']} 帧，看了 {len(pool)} 帧，"
+                         f"脸占画面 {_area(box(best)) * 100:.1f}%）")
+                frames.append(pick)
+                continue
             if "cands" not in k:
                 frames.append(k["frame"])
                 continue
             if q is None:
-                d = _phrase(_ask(vlm, VIS_DESC["swap" if swap else "edit"].format(who=who or "the main person", target=target),
+                d = _phrase(_ask(vlm, VIS_DESC["edit"].format(who=who or "the main person", target=target),
                                  [_small(source[first:first + 1])], 60), 30)
-                q = VIS_ASK["swap" if swap else "edit"].format(desc=d or (who or "the main person"))
+                q = VIS_ASK["edit"].format(desc=d or (who or "the main person"))
                 log.info(f"[画关键帧] 接力段找：{d}")
             pick = None
             for f in sorted(k["cands"], key=lambda f: abs(f - k["frame"])):
@@ -355,12 +375,12 @@ class WZFRemakePaint(io.ComfyNode):
                     pick = f
                     break
             frames.append(pick)
+        first = next((f for f in frames if f is not None), first)  # 描述衣服用脸最大、最清楚的那帧
         todo = sorted({f for f in frames if f is not None})
         keyframes = source[torch.tensor(todo)][..., :3]
         look = ""
         if swap:
-            look = _phrase(_ask(vlm, "Describe the person in this photo in one short English phrase: apparent age and gender, "
-                                     "face, hair style and hair colour. No clothes, no background.", [_small(reference)], 80), 30)
+            look = _phrase(_ask(vlm, PERSON_ASK, [_small(reference)], 80), 30)
             log.info(f"[画关键帧] 参考图里的人：{look}")
         outfit = target
         if mode == "whole" and not target:
@@ -405,16 +425,19 @@ class WZFRemakePaint(io.ComfyNode):
 
         outs = []
         for i in range(keyframes.shape[0]):
+            if swap:
+                # 自检：脸换掉没有（官方智能体也查 kept_source_face：新头发下面还是原来那张脸）。
+                # 只给 8B 一张图（画好的那张裁到只剩脸），让它在"原来的人 / 参考图的人"两句描述里二选一。
+                # 11-17 实测女换男：三张图对比着问"是参考图的人还是原来的人"，整图、裁脸都 6 次全答 OLD（画对了也说没换）；
+                # 改成单图二选一后，画好的 / 原帧各 2 张、两种选项顺序，8 次全对
+                ob = box(todo[i])
+                old = _phrase(_ask(vlm, PERSON_ASK, [_small(keyframes[i:i + 1])], 80), 30)
             for t in range(3):
                 img = paint(i, seed + i + 1000 * t)
-                if not swap:
+                if not swap or not (old and look):
                     break
-                # 自检：脸换掉没有（官方智能体也查 kept_source_face：新头发下面还是原来那张脸）
-                ans = _ask(vlm, "Image 1 is a video frame. Image 2 is the same frame after editing. Image 3 is a reference "
-                                "photo. Look only at the main person's face and hair in image 2. Is it the person from image 3 "
-                                "(answer NEW) or still the person from image 1 (answer OLD)? Answer one word.",
-                           [_small(keyframes[i:i + 1]), _small(img), _small(reference)], 8).upper()
-                ok = "OLD" not in ans
+                ans = _ask(vlm, PICK_ASK.format(a=old, b=look), [_small(_crop(img, ob) if ob else img)], 4).upper()
+                ok = (re.findall(r"\b([AB])\b", ans) or ["B"])[-1] == "B"  # 答不出 A/B 时不重画
                 log.info(f"[画关键帧] 第 {i + 1} 张第 {t + 1} 次：自检 {'换掉了' if ok else '还是原来的人，换种子重画'}（{ans}）")
                 if ok:
                     break
@@ -449,6 +472,37 @@ def _phrase(s, limit=60):
 
 def _small(img, w=640):
     return resize(img[:1, ..., :3], w, max(32, round(w * img.shape[1] / img.shape[2])))
+
+
+PERSON_ASK = ("Describe the person in this photo in one short English phrase: apparent age and gender, face, hair style and "
+              "hair colour. No clothes, no background.")
+PICK_ASK = "Which description fits the person in this photo better? A: {a}. B: {b}. Answer A or B."
+FACE_BOX = ("Find the face of {who} in this image. Reply only with its bounding box as [x1, y1, x2, y2] in 0-1000 "
+            "coordinates. If no face is visible (for example the person is seen from behind), reply NONE.")
+
+
+def _face_box(vlm, img, who=""):
+    """8B 框人脸（Qwen3-VL 给 0-1000 的相对坐标）→ (x1, y1, x2, y2) 0-1，看不见脸返回 None。"""
+    a = _ask(vlm, FACE_BOX.format(who=who or "the main person"), [_small(img)], 30)
+    n = [int(x) for x in re.findall(r"\d+", a)[:4]]
+    if "NONE" in a.upper() or len(n) < 4:
+        return None
+    x1, y1, x2, y2 = (min(max(v, 0), 1000) / 1000 for v in n)
+    return (x1, y1, x2, y2) if x2 - x1 > 0.01 and y2 - y1 > 0.01 else None
+
+
+def _area(b):
+    return 0.0 if b is None else (b[2] - b[0]) * (b[3] - b[1])
+
+
+def _crop(img, b, pad=0.4):
+    """按脸框裁出来（四周各多留 40%）。"""
+    H, W = img.shape[1], img.shape[2]
+    x1, y1, x2, y2 = b
+    w, h = x2 - x1, y2 - y1
+    X1, Y1 = max(0, int((x1 - w * pad) * W)), max(0, int((y1 - h * pad) * H))
+    X2, Y2 = min(W, int((x2 + w * pad) * W) + 1), min(H, int((y2 + h * pad) * H) + 1)
+    return img[:1, Y1:Y2, X1:X2, :3]
 
 
 CLOTHES_ASK = ("Describe the clothes of {who} in this video frame in one short English phrase: each garment and its colour, "
