@@ -431,10 +431,18 @@ class WZFRemakePaint(io.ComfyNode):
             samples = nodes.common_ksampler(m, s, steps, 1.0, smp, "simple", enc[0], enc[1], enc[2])[0]
             return nodes.VAEDecode().decode(vae, samples)[0][:1, ..., :3]
 
+        hm = head if head is not None else (model if mode == "head" else None)  # 修脸用的换头模型
+
         def paint(i, s):
             img = draw(keyframes[i:i + 1], model, prompt, sampler, s)
             if head is not None:  # 第二遍：只重画头（接第一遍的原尺寸结果，不先缩小）
                 img = draw(img, head, HEADSWAP, "lcm", s)
+            b = box(todo[i]) if hm is not None else None
+            if b and max((b[2] - b[0]) * img.shape[2], (b[3] - b[1]) * img.shape[1]) < FIX_FACE_PX:
+                # 修脸：脸小（远景 / 中景）时把头部裁出来，放大到约 100 万像素用换头模型照参考图再画一遍，羽化贴回。
+                # 画关键帧时整张图只有约 100 万像素，远景里脸才一两百像素，五官画不出参考图的样子
+                img = _paste_face(img, b, lambda crop: draw(crop, hm, HEADSWAP, "lcm", s + 7))
+                log.info(f"[画关键帧] 第 {i + 1} 张脸小，单独放大修了一遍脸")
             return resize(img, W, H)
 
         outs = []
@@ -507,6 +515,27 @@ def _face_box(vlm, img, who=""):
 
 def _area(b):
     return 0.0 if b is None else (b[2] - b[0]) * (b[3] - b[1])
+
+
+FIX_FACE_PX = 320  # 画好的关键帧里脸（框的长边）小于这么多像素就单独修脸
+
+
+def _paste_face(img, b, redraw):
+    """以脸框为中心裁一块正方形（约脸的 2.6 倍：带上头发和肩膀），交给 redraw 放大重画，缩回原尺寸后羽化贴回。"""
+    H, W = img.shape[1], img.shape[2]
+    x1, y1, x2, y2 = b
+    side = int(min(max((x2 - x1) * W, (y2 - y1) * H) * 2.6, H, W))
+    cx, cy = (x1 + x2) / 2 * W, (y1 + y2) / 2 * H
+    X1 = int(min(max(cx - side / 2, 0), W - side))
+    Y1 = int(min(max(cy - side * 0.45, 0), H - side))
+    crop = img[:, Y1:Y1 + side, X1:X1 + side]
+    new = resize(redraw(crop), side, side).to(crop)
+    t = torch.linspace(-1, 1, side, device=crop.device)
+    d = torch.maximum(t.view(-1, 1).abs(), t.view(1, -1).abs())
+    m = ((1 - d) / 0.3).clamp(0, 1)[None, ..., None]  # 中间全用新画的，外圈 15% 渐变回原图
+    out = img.clone()
+    out[:, Y1:Y1 + side, X1:X1 + side] = crop * (1 - m) + new * m
+    return out
 
 
 def _crop(img, b, pad=0.4):
