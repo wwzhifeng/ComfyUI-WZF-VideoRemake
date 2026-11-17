@@ -405,23 +405,37 @@ class WZFRemakePaint(io.ComfyNode):
         model = nodes.UNETLoader().load_unet(find("diffusion_models", QWEN["unet"], "qwen_image_2.1_bf16.safetensors"), "default")[0]
         loras = [find("loras", QWEN["detail"], optional=True),  # 细节 LoRA 可选：云平台没有就跳过
                  find("loras", QWEN["turbo"], keys=("viggle-turbo", "6step"))]
-        if mode == "head":
-            loras.append(find("loras", QWEN["bfs"], keys=("bfs_head_v1.1", "qwen")))
         for name in loras:
             if name:
                 model = nodes.LoraLoaderModelOnly().load_lora_model_only(model, name, 1.0)[0]
+        # 换头模型 = 同一个底模 + BFS 换头 LoRA。「只换头」直接用它画；「换整个人」先整个人换掉（衣服、身形、发型），
+        # 再用它把头照参考图重画一遍（11-17 实测：只画一遍时脸型沿用原帧那个人，女换男成了"瘦脸版的他"，不够像）
+        bfs = find("loras", QWEN["bfs"], keys=("bfs_head_v1.1", "qwen"), optional=mode == "whole") if swap else None
+        head = nodes.LoraLoaderModelOnly().load_lora_model_only(model, bfs, 1.0)[0] if bfs else None
+        if mode == "head":
+            model = head
         model = QwenImage21Cache.execute(model, "auto", "default")[0]
+        if mode == "whole" and head is not None:
+            head = QwenImage21Cache.execute(head, "auto", "default")[0]
+        else:
+            head = None
         clip = nodes.CLIPLoader().load_clip(qwen_te(), "qwen_image", "default")[0]
         vae = nodes.VAELoader().load_vae(find("vae", QWEN["vae"]))[0]
         H, W = keyframes.shape[1], keyframes.shape[2]
 
-        def paint(i, s):
-            imgs = {"image_1": keyframes[i:i + 1]}
+        def draw(base, m, p, smp, s):
+            imgs = {"image_1": base}
             if reference is not None:
                 imgs["image_2"] = reference[:1, ..., :3]
-            enc = TextEncodeQwenImage21.execute(clip, prompt, "", vae, 1024, images=imgs)
-            samples = nodes.common_ksampler(model, s, steps, 1.0, sampler, "simple", enc[0], enc[1], enc[2])[0]
-            return resize(nodes.VAEDecode().decode(vae, samples)[0][:1, ..., :3], W, H)
+            enc = TextEncodeQwenImage21.execute(clip, p, "", vae, 1024, images=imgs)
+            samples = nodes.common_ksampler(m, s, steps, 1.0, smp, "simple", enc[0], enc[1], enc[2])[0]
+            return nodes.VAEDecode().decode(vae, samples)[0][:1, ..., :3]
+
+        def paint(i, s):
+            img = draw(keyframes[i:i + 1], model, prompt, sampler, s)
+            if head is not None:  # 第二遍：只重画头（接第一遍的原尺寸结果，不先缩小）
+                img = draw(img, head, HEADSWAP, "lcm", s)
+            return resize(img, W, H)
 
         outs = []
         for i in range(keyframes.shape[0]):
@@ -443,7 +457,7 @@ class WZFRemakePaint(io.ComfyNode):
                     break
             outs.append(img)
             log.info(f"[画关键帧] 第 {i + 1}/{keyframes.shape[0]} 张（第 {todo[i]} 帧）完成")
-        del model, clip, vae, vlm
+        del model, head, clip, vae, vlm
         free()
         painted = torch.cat(outs)
         compare = torch.cat([keyframes[..., :3], painted], dim=2)
