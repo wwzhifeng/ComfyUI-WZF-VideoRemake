@@ -354,7 +354,8 @@ class WZFRemakePaint(io.ComfyNode):
                 pool = {k["frame"], *(k.get("cands") or []), *(lo + (hi - 1 - lo) * j // 7 for j in range(8))}
                 pool = sorted(f for f in pool if 0 <= f < source.shape[0])
                 best = max(pool, key=lambda f: (_area(box(f)), -abs(f - k["frame"])))
-                pick = best if _area(box(best)) > 0 else (None if "cands" in k else k["frame"])
+                # 看不见脸：接力段不画；写了「换谁」（多人）时也不画——这个镜头里可能根本没有他，硬画会换掉别人
+                pick = best if _area(box(best)) > 0 else (None if "cands" in k or who else k["frame"])
                 log.info(f"[画关键帧] 挑脸最大的一帧：第 {pick} 帧（原定第 {k['frame']} 帧，看了 {len(pool)} 帧，"
                          f"脸占画面 {_area(box(best)) * 100:.1f}%）")
                 frames.append(pick)
@@ -376,6 +377,19 @@ class WZFRemakePaint(io.ComfyNode):
                     break
             frames.append(pick)
         first = next((f for f in frames if f is not None), first)  # 描述衣服用脸最大、最清楚的那帧
+        if swap:
+            # 脸太小提醒：镜头里脸最大的那帧也不到画面 1.5%（远景），五官只有几个像素，换出来的脸可能不像。
+            # 照样换（不换的话这个镜头里还是原来的人，前后对不上），只提醒用户。工作台把 [提醒] 这一行显示成黄字
+            used = [f for f in frames if f is not None]
+            if not used:
+                raise RuntimeError(f"视频里没找到「{who or '要换的人'}」的脸。检查一下「换谁」写得对不对，或者换一段能看到正脸的视频。")
+            tiny = [f for f in used if 0 < _area(box(f)) < SMALL_FACE]
+            if tiny and len(tiny) == len(used):
+                log.warning(f"[提醒] 这段视频里人离镜头太远（脸不到画面 {SMALL_FACE * 100:.1f}%），换出来的脸可能不像；"
+                            "换成人更大的近景、中景素材效果更好")
+            for f in tiny if len(tiny) < len(used) else []:
+                log.warning(f"[提醒] {f / R.FPS:.1f} 秒处的镜头人太小（脸只占画面 {_area(box(f)) * 100:.1f}%），"
+                            "这个镜头换出来的脸可能不像")
         todo = sorted({f for f in frames if f is not None})
         keyframes = source[torch.tensor(todo)][..., :3]
         look = ""
@@ -403,10 +417,11 @@ class WZFRemakePaint(io.ComfyNode):
         if mode == "head" or staged:
             prompt, sampler = HEADSWAP, "lcm"
             if staged:
-                body = (f"In <image1>, keep the face and the head of the person exactly the same. Make the rest of the person "
+                tgt = who or "the person"
+                body = (f"In <image1>, keep the face and the head of {tgt} exactly the same. Make the rest of {tgt} "
                         f"match {look}" + (f", wearing {outfit}" if outfit else "") + ": body shape and clothes; remove any "
-                        "hair that does not belong to this hair style. Keep exactly the same pose, hand positions, expression, "
-                        "objects, room, lighting, camera angle and composition. Photorealistic, sharp details.")
+                        "hair that does not belong to this hair style. Keep everyone else, the pose, hand positions, expression, "
+                        "objects, room, lighting, camera angle and composition exactly the same. Photorealistic, sharp details.")
         elif mode == "whole":
             prompt = (f"Replace {who or 'the main person'} in <image1> with the person from <image2>"
                       + (f" ({look})" if look else "") + ": the face, the hair style and the hair colour of <image2>"
@@ -445,15 +460,26 @@ class WZFRemakePaint(io.ComfyNode):
             base = keyframes[i:i + 1]
             b = box(todo[i]) if head is not None else None
             if mode == "head" or staged:
-                # ① 原帧上换头。保险：头以外的背景整个变了 = 把参考照片照搬了，换种子再来；两次都这样就退回原帧（自检会判没换、重画）
+                # ① 原帧上换头。保险：头以外的背景整个变了 = 把参考照片照搬了，换种子再来；都这样就退回原帧（自检会判没换、重画）。
+                # 写了「换谁」（多人）时，换头提示词没法指定人，就只把那个人的头部裁出来换、羽化贴回，别人不动
                 img = base
-                for k in range(2):
-                    out = draw(base, head, HEADSWAP, "lcm", s + 13 * k)
-                    d = _bg_diff(base, out, b)
-                    log.info(f"[画关键帧] 第 {i + 1} 张换头：背景变化 {d:.3f}{'，照搬了参考照片，丢掉' if d > COPY_DIFF else ''}")
-                    if d <= COPY_DIFF:
-                        img = out
-                        break
+                if who and b:
+                    sc = (1024 * 1024 / (H * W)) ** 0.5  # 先放大到约 100 万像素再裁，免得换完的头只有原帧分辨率
+                    up = resize(base, round(W * sc / 32) * 32, round(H * sc / 32) * 32)
+                    for k in range(3):
+                        out = _paste_face(up, b, lambda crop: draw(crop, head, HEADSWAP, "lcm", s + 13 * k), 3.2)
+                        log.info(f"[画关键帧] 第 {i + 1} 张只换「{who}」的头：{'换好了' if out is not None else '照搬了参考照片，丢掉'}")
+                        if out is not None:
+                            img = out
+                            break
+                else:
+                    for k in range(2):
+                        out = draw(base, head, HEADSWAP, "lcm", s + 13 * k)
+                        d = _bg_diff(base, out, b)
+                        log.info(f"[画关键帧] 第 {i + 1} 张换头：背景变化 {d:.3f}{'，照搬了参考照片，丢掉' if d > COPY_DIFF else ''}")
+                        if d <= COPY_DIFF:
+                            img = out
+                            break
             else:
                 img = draw(base, model, prompt, sampler, s)
             if b and max((b[2] - b[0]) * img.shape[2], (b[3] - b[1]) * img.shape[1]) < FIX_FACE_PX:
@@ -539,6 +565,7 @@ def _area(b):
 
 
 FIX_FACE_PX = 320  # 画好的关键帧里脸（框的长边）小于这么多像素就单独修脸
+SMALL_FACE = 0.015  # 镜头里最大的脸也小于画面的这个比例，就提醒用户人太小（11-17：雨伞视频 3.8% 修脸后像，0.9% 时脸只有几个像素）
 COPY_DIFF = 0.15  # 换头前后头以外的背景平均差超过它 = 模型把参考照片照搬了（11-17 实测照搬时 0.37）
 
 
@@ -557,11 +584,12 @@ def _bg_diff(a, c, b):
     return float((a[0] - c[0].to(a)).abs().mean(-1)[keep].mean())
 
 
-def _paste_face(img, b, redraw):
-    """以脸框为中心裁一块正方形（约脸的 2.6 倍：带上头发和肩膀），交给 redraw 放大重画，缩回原尺寸后羽化贴回。"""
+def _paste_face(img, b, redraw, k=2.6):
+    """以脸框为中心裁一块正方形（约脸的 k 倍：带上头发和肩膀），交给 redraw 放大重画，缩回原尺寸后羽化贴回。
+    外圈整个变了（照搬了参考照片）返回 None。"""
     H, W = img.shape[1], img.shape[2]
     x1, y1, x2, y2 = b
-    side = int(min(max((x2 - x1) * W, (y2 - y1) * H) * 2.6, H, W))
+    side = int(min(max((x2 - x1) * W, (y2 - y1) * H) * k, H, W))
     cx, cy = (x1 + x2) / 2 * W, (y1 + y2) / 2 * H
     X1 = int(min(max(cx - side / 2, 0), W - side))
     Y1 = int(min(max(cy - side * 0.45, 0), H - side))
